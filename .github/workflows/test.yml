@@ -1,0 +1,43 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile Python sources
+        run: >-
+          python -m py_compile
+          scripts/sync_from_canonical.py
+          scripts/provision_service_account.py
+          scripts/test_provision_service_account.py
+          tests/test_sync_from_canonical.py
+      - name: Verify mirror state
+        run: python scripts/sync_from_canonical.py --mirror . --verify-state
+      - name: Test mirror and provisioning logic
+        run: |
+          python -m unittest discover -s tests -v
+          python scripts/test_provision_service_account.py
+      - name: Generate the synthetic plan
+        run: >-
+          python scripts/provision_service_account.py plan
+          assets/service-account-plan.example.json
+      - name: Compile the macOS Keychain helper
+        run: >-
+          swiftc scripts/store_macos_keychain_secret.swift
+          -o /tmp/store-macos-keychain-secret

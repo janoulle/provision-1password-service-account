@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Mirror state contains only SHA-256 content hashes"
+paths = ['''^\.mirror-state\.json$''']

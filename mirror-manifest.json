@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "canonical": {
+    "skill": "provision-1password-service-account"
+  },
+  "files": [
+    {
+      "source": "SKILL.md",
+      "destination": "SKILL.md"
+    },
+    {
+      "source": "agents/openai.yaml",
+      "destination": "agents/openai.yaml"
+    },
+    {
+      "source": "assets/service-account-plan.example.json",
+      "destination": "assets/service-account-plan.example.json"
+    },
+    {
+      "source": "references/security-model.md",
+      "destination": "references/security-model.md"
+    },
+    {
+      "source": "scripts/provision_service_account.py",
+      "destination": "scripts/provision_service_account.py"
+    },
+    {
+      "source": "scripts/store_macos_keychain_secret.swift",
+      "destination": "scripts/store_macos_keychain_secret.swift"
+    },
+    {
+      "source": "scripts/test_provision_service_account.py",
+      "destination": "scripts/test_provision_service_account.py"
+    }
+  ]
+}
