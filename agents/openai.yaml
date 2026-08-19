@@ -1,0 +1,4 @@
+interface:
+  display_name: "Provision 1Password Service Account"
+  short_description: "Create and verify least-privilege service accounts"
+  default_prompt: "Use $provision-1password-service-account to create a dedicated 1Password vault and least-privilege service account."
