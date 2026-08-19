@@ -1,25 +1,22 @@
 # Contributing
 
 Contributions are welcome when they preserve least privilege, safe token
-handling, explicit provider writes, recovery, and the mirror boundary.
+handling, explicit provider writes, recovery, and documented security
+boundaries.
 
 ## Before opening a pull request
 
 1. Use synthetic vault, item, account, and Keychain identifiers.
 2. Never add a token, credential, account address, personal path, private host,
-   provider output, screenshot, or private repository reference.
+   provider output, screenshot, or internal-only resource reference.
 3. Keep service-account creation fail-closed. Do not place a token in a command
    argument, shell profile, tracked environment file, log, or clipboard.
 4. Add tests for changed validation, command construction, or storage behavior.
 5. Check current primary 1Password and Apple documentation for consequential
    authentication or Keychain changes.
-6. Reconcile accepted distributable changes with the canonical source before
-   release.
-7. Run:
+6. Run:
 
    ```sh
-   python3 scripts/sync_from_canonical.py --mirror . --verify-state
-   python3 -m unittest discover -s tests -v
    python3 scripts/test_provision_service_account.py
    python3 scripts/provision_service_account.py plan \
      assets/service-account-plan.example.json

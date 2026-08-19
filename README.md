@@ -5,11 +5,6 @@ application or trust domain. The skill uses a dedicated vault, an explicit item
 allowlist, safe one-time-token handling, a recovery copy in 1Password, and an
 unattended copy in the macOS login Keychain.
 
-This repository is a curated mirror of one skill whose canonical source is
-maintained in a private agent-configuration repository. It does not contain
-personal configuration, provider credentials, or unrelated skills. See
-[MIRRORING.md](MIRRORING.md).
-
 ## What it automates
 
 - Validate and preview a non-secret service-account manifest.
@@ -91,17 +86,12 @@ python3 scripts/provision_service_account.py sync-keychain \
 ## Validate
 
 ```sh
-python3 scripts/sync_from_canonical.py --mirror . --verify-state
-python3 -m unittest discover -s tests -v
 python3 scripts/test_provision_service_account.py
 python3 scripts/provision_service_account.py plan \
   assets/service-account-plan.example.json
 swiftc scripts/store_macos_keychain_secret.swift \
   -o /tmp/store-macos-keychain-secret
 ```
-
-The source-to-mirror check also runs before a release when the private
-canonical source is available.
 
 ## Security boundary and limitations
 

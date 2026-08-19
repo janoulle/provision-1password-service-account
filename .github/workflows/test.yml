@@ -23,16 +23,10 @@ jobs:
       - name: Compile Python sources
         run: >-
           python -m py_compile
-          scripts/sync_from_canonical.py
           scripts/provision_service_account.py
           scripts/test_provision_service_account.py
-          tests/test_sync_from_canonical.py
-      - name: Verify mirror state
-        run: python scripts/sync_from_canonical.py --mirror . --verify-state
-      - name: Test mirror and provisioning logic
-        run: |
-          python -m unittest discover -s tests -v
-          python scripts/test_provision_service_account.py
+      - name: Test provisioning logic
+        run: python scripts/test_provision_service_account.py
       - name: Generate the synthetic plan
         run: >-
           python scripts/provision_service_account.py plan
