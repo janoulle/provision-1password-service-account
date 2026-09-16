@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -90,6 +91,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
         if identity in seen_items:
             raise ProvisionError("items contains the same source vault and title more than once")
         seen_items.add(identity)
+        if item.get("transfer", "move") not in {"move", "copy"}:
+            raise ProvisionError("item transfer must be move or copy")
         if source_vault == vault_name:
             raise ProvisionError("an item's source_vault must differ from the destination vault")
 
@@ -114,6 +117,7 @@ def safe_plan(manifest: dict[str, Any]) -> dict[str, Any]:
                 "title": item["title"],
                 "from": item["source_vault"],
                 "to": manifest["vault"]["name"],
+                "transfer": item.get("transfer", "move"),
             }
             for item in manifest["items"]
         ],
@@ -123,7 +127,7 @@ def safe_plan(manifest: dict[str, Any]) -> dict[str, Any]:
         "keychain_account": manifest["token_storage"]["keychain_account"],
         "provider_changes": [
             "create one vault",
-            "move the selected items",
+            "transfer selected items using each item's move or copy policy",
             "create one immutable service-account boundary",
             "create one recovery Password item",
             "create one macOS Keychain item",
@@ -138,14 +142,25 @@ def run_command(
     environment: dict[str, str] | None = None,
     allow_failure: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
-    result = subprocess.run(
-        arguments,
-        input=input_data,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-        check=False,
-    )
+    # A real OS pipe is required by op's stdin detection. Capture all output.
+    # A separate process group permits bounded cleanup of shell descendants.
+    try:
+        process = subprocess.Popen(
+            arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, preexec_fn=os.setpgrp,
+        )
+        try:
+            stdout, stderr = process.communicate(input_data, timeout=120)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise ProvisionError("command interrupted or timed out; reconcile writes before retry") from None
+    except OSError:
+        raise ProvisionError("command could not start") from None
+    result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
     if result.returncode != 0 and not allow_failure:
         command_name = " ".join(arguments[:3])
         raise ProvisionError(f"{command_name} failed with exit {result.returncode}")
@@ -194,31 +209,16 @@ def vault_names(environment: dict[str, str]) -> list[str]:
 
 
 def resolve_source_items(manifest: dict[str, Any], environment: dict[str, str]) -> list[dict[str, str]]:
-    cache: dict[str, Any] = {}
     resolved: list[dict[str, str]] = []
     for selected in manifest["items"]:
         source_vault = selected["source_vault"]
-        if source_vault not in cache:
-            cache[source_vault] = run_json(
-                ["op", "item", "list", "--vault", source_vault, "--format=json"],
-                environment=environment,
-            )
-        matches = [
-            item
-            for item in cache[source_vault]
-            if isinstance(item, dict) and item.get("title") == selected["title"] and isinstance(item.get("id"), str)
-        ]
-        if len(matches) != 1:
-            raise ProvisionError(
-                f"expected one exact item named {selected['title']!r} in {source_vault!r}; found {len(matches)}"
-            )
-        resolved.append(
-            {
-                "id": matches[0]["id"],
-                "title": selected["title"],
-                "source_vault": source_vault,
-            }
-        )
+        item = run_json(["op", "item", "get", selected["title"], "--vault", source_vault,
+                         "--format=json"], environment=environment)
+        if not isinstance(item, dict) or item.get("title") != selected["title"] or not isinstance(item.get("id"), str):
+            raise ProvisionError("source item did not resolve to one exact identity")
+        resolved.append({"id": item["id"], "title": selected["title"],
+                         "source_vault": source_vault, "transfer": selected.get("transfer", "move")})
+
     return resolved
 
 
@@ -281,7 +281,14 @@ def preflight(
     )
     if existing_recovery.returncode == 0:
         raise ProvisionError("the recovery item title already exists")
-    if keychain_lookup(storage, allow_failure=True).returncode == 0:
+    # Only the CLI's explicit item-not-found response is absence. Authentication,
+    # transport and unknown errors must not lead to a duplicate recovery write.
+    if b"isn't an item in" not in existing_recovery.stderr:
+        raise ProvisionError("recovery item absence is unverified; reconcile before setup")
+    keychain_state = keychain_lookup(storage, allow_failure=True)
+    if keychain_state.returncode not in (0, 44):
+        raise ProvisionError("Keychain item absence is unverified; reconcile before setup")
+    if keychain_state.returncode == 0:
         raise ProvisionError("the configured macOS Keychain item already exists")
 
     resolved = resolve_source_items(manifest, environment)
@@ -330,6 +337,31 @@ def create_recovery_item(
         raise IncompleteProvisionError("the service account exists, but its recovery item was not created")
 
 
+def copy_selected_item(item: dict[str, str], destination: str, environment: dict[str, str]) -> None:
+    """Preserve an owner recovery item while creating a separate machine copy."""
+    source = run_json(["op", "item", "get", item["id"], "--vault", item["source_vault"],
+                       "--format=json", "--reveal"], environment=environment)
+    if source.get("id") != item["id"] or source.get("title") != item["title"]:
+        raise ProvisionError("copy source identity mismatch")
+    if source.get("files") or source.get("category") not in {"PASSWORD", "API_CREDENTIAL"}:
+        raise ProvisionError("copy supports credential items without attachments only")
+    payload = {key: source[key] for key in ("title", "category", "fields", "sections") if key in source}
+    result = run_command(["op", "item", "create", "-", "--vault", destination, "--format=json"],
+                         input_data=json.dumps(payload).encode(), environment=environment)
+    try:
+        created = json.loads(result.stdout)
+        identifier = created["id"]
+    except (ValueError, KeyError, TypeError):
+        raise ProvisionError("copy may exist; reconcile before retry") from None
+    saved = run_json(["op", "item", "get", identifier, "--vault", destination,
+                      "--format=json", "--reveal"], environment=environment)
+    def fields(value: dict) -> dict:
+        return {(f.get("section", {}).get("id"), f.get("id")): f.get("value", "")
+                for f in value.get("fields", [])}
+    if saved.get("id") != identifier or saved.get("title") != source["title"] or fields(saved) != fields(source):
+        raise ProvisionError("copy readback mismatch; reconcile before retry")
+
+
 def read_recovery_token(manifest: dict[str, Any], environment: dict[str, str]) -> bytes:
     storage = manifest["token_storage"]
     result = run_command(
@@ -357,6 +389,12 @@ def service_environment(token: bytes) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("OP_CONNECT_HOST", None)
     environment.pop("OP_CONNECT_TOKEN", None)
+    if not value.startswith("ops_") or len(value) <= 512:
+        raise ProvisionError("a complete service-account token is required; no personal fallback")
+    for name in list(environment):
+        if name.startswith("OP_SESSION"):
+            environment.pop(name)
+    environment["OP_BIOMETRIC_UNLOCK_ENABLED"] = "false"
     environment["OP_SERVICE_ACCOUNT_TOKEN"] = value
     return environment
 
@@ -386,6 +424,10 @@ def verify_scope(manifest: dict[str, Any], token: bytes) -> None:
     )
     if denial.returncode == 0:
         raise ProvisionError("the service account can access the configured recovery vault")
+    # A transport error is not proof of denial. The authoritative accessible
+    # vault inventory above establishes exclusion; do not label arbitrary errors.
+    if vault_names(environment) != [expected_vault]:
+        raise ProvisionError("post-check vault inventory failed")
 
 
 def apply(manifest: dict[str, Any], confirmation: str) -> None:
@@ -412,6 +454,9 @@ def apply(manifest: dict[str, Any], confirmation: str) -> None:
             )
             writes_started = True
             for item in resolved_items:
+                if item.get("transfer") == "copy":
+                    copy_selected_item(item, manifest["vault"]["name"], environment)
+                    continue
                 run_command(
                     [
                         "op",
@@ -507,7 +552,7 @@ def audit(manifest: dict[str, Any]) -> None:
     finally:
         token = b""
     print("verified: service account can access only the dedicated vault and exact item-title set")
-    print("verified: configured recovery vault access is denied")
+    print("verified: recovery vault is excluded from the accessible vault inventory")
 
 
 def sync_keychain(manifest: dict[str, Any], confirmation: str) -> None:
@@ -520,6 +565,8 @@ def sync_keychain(manifest: dict[str, Any], confirmation: str) -> None:
     if not token.startswith(b"ops_") or len(token) <= 512:
         raise ProvisionError("the recovery item does not contain a complete service-account token")
     try:
+        # Verify the replacement before overwriting a working unattended copy.
+        verify_scope(manifest, token)
         with tempfile.TemporaryDirectory(prefix="op-service-account-") as temporary:
             helper = compile_keychain_helper(Path(temporary))
             run_command(
@@ -539,6 +586,41 @@ def sync_keychain(manifest: dict[str, Any], confirmation: str) -> None:
     print("verified: service account can access only the dedicated vault and exact item-title set")
 
 
+def run_batch(manifest: dict[str, Any], env_file: Path, command: list[str]) -> None:
+    """Use the standard op run implementation, not a persistent secret broker."""
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise ProvisionError("run requires a reviewed child command after --")
+    # The env file must contain only explicit secret references, no plaintext.
+    import re
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    references = []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=(op://[^\r\n]+)", line)
+        if not match or match[1].startswith("OP_"):
+            raise ProvisionError("env file must contain NAME=op://vault/item/field references only")
+        if not match[2].startswith("op://" + manifest["vault"]["name"] + "/"):
+            raise ProvisionError("reference is outside the manifest vault")
+        references.append(match)
+    if not references:
+        raise ProvisionError("at least one secret reference is required")
+    token = keychain_lookup(manifest["token_storage"], allow_failure=False).stdout.strip()
+    environment = service_environment(token)
+    # Discard ambient op references to prevent unrelated resolution by op run.
+    environment = {k: v for k, v in environment.items() if not v.startswith("op://")}
+    result = run_command([
+        "op", "run", "--env-file", str(env_file), "--",
+        "/usr/bin/env", "-u", "OP_SERVICE_ACCOUNT_TOKEN", *command,
+    ], environment=environment, allow_failure=True)
+    # Even masked child output can reveal transformed secrets. Report only status.
+    if result.returncode:
+        raise ProvisionError("credential batch failed; child output withheld")
+    print("completed: one credential batch; child output withheld")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -549,6 +631,10 @@ def parse_arguments() -> argparse.Namespace:
         mutating_parser = subparsers.add_parser(name)
         mutating_parser.add_argument("manifest", type=Path)
         mutating_parser.add_argument("--confirm", required=True)
+    runner = subparsers.add_parser("run")
+    runner.add_argument("manifest", type=Path)
+    runner.add_argument("env_file", type=Path)
+    runner.add_argument("child", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
 
@@ -562,6 +648,8 @@ def main() -> int:
             apply(manifest, arguments.confirm)
         elif arguments.command == "audit":
             audit(manifest)
+        elif arguments.command == "run":
+            run_batch(manifest, arguments.env_file, arguments.child)
         elif arguments.command == "sync-keychain":
             sync_keychain(manifest, arguments.confirm)
     except IncompleteProvisionError as error:

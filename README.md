@@ -9,7 +9,7 @@ unattended copy in the macOS login Keychain.
 
 - Validate and preview a non-secret service-account manifest.
 - Resolve exact source items before any provider write.
-- Create one user-managed vault and move only the selected items.
+- Create one user-managed vault and move or copy only the selected items.
 - Create an immutable service-account permission boundary.
 - Capture the one-time token in process memory instead of shell history or a
   plaintext file.
@@ -17,6 +17,8 @@ unattended copy in the macOS login Keychain.
 - Store an unattended copy in the macOS login Keychain.
 - Audit the exact accessible vault and item-title set.
 - Synchronize a rotated recovery token back to Keychain.
+- Run a reviewed command with explicit secret references through one bounded
+  `op run` batch without exposing the service-account token to the child.
 
 ## Requirements
 
@@ -74,6 +76,14 @@ Audit an existing boundary from its Keychain copy:
 python3 scripts/provision_service_account.py audit /path/to/manifest.json
 ```
 
+Run one reviewed batch with an environment file that contains only
+`NAME=op://vault/item/field` references inside the manifest vault:
+
+```sh
+python3 scripts/provision_service_account.py run \
+  /path/to/manifest.json /path/to/references.env -- <reviewed-command>
+```
+
 After saving a rotated token in the configured recovery item, synchronize it
 to Keychain without using the clipboard or a command argument:
 
@@ -95,17 +105,21 @@ swiftc scripts/store_macos_keychain_secret.swift \
 
 ## Security boundary and limitations
 
-- The live setup creates a vault, moves selected items, creates a service
+- The live setup creates a vault, transfers selected items, creates a service
   account, and stores two token copies. Use `plan` before `apply`.
 - 1Password does not provide a transaction across those writes. If a later
   step fails, inspect the destination vault, source items, Recently Deleted,
-  recovery item, Keychain item, and service-account list before any retry.
+  recovery item, Keychain item, and Developer-console service-account inventory
+  before any retry. CLI 2.34.1 does not provide `op service-account list`.
 - The script rejects an ambient service-account or 1Password Connect identity
   during creation to avoid using the wrong authority.
 - The Keychain helper trusts `/usr/bin/security` for unattended retrieval. Any
   process running as the unlocked Mac user can invoke that tool to retrieve
   this one token. The service account's narrow vault scope is the primary
   least-privilege control.
+- The first `/usr/bin/security` read can require one macOS access dialog. Select
+  **Always Allow** for the exact scoped item, then require a second lookup to
+  complete without another dialog before calling access unattended.
 - The workflow currently supports macOS. It does not install a 1Password
   service-account token on a production server.
 - The audit verifies accessible vaults and item titles. It does not test write

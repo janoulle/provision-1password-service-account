@@ -118,5 +118,81 @@ class ManifestTests(unittest.TestCase):
                     MODULE.apply(manifest, "example-provisioner")
 
 
+class BatchTests(unittest.TestCase):
+    def test_invalid_token_never_falls_back(self):
+        with self.assertRaises(MODULE.ProvisionError):
+            MODULE.service_environment(b"")
+
+    def test_batch_loads_bootstrap_once_and_removes_it_from_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            refs = Path(directory) / "refs.env"
+            refs.write_text("API_TOKEN=op://Example Production/credential/password\n")
+            token = b"ops_" + b"x" * 600
+            with (mock.patch.object(MODULE, "keychain_lookup", return_value=subprocess.CompletedProcess([], 0, token)) as lookup,
+                  mock.patch.object(MODULE, "run_command", return_value=subprocess.CompletedProcess([], 0, b"never-print-me")) as run,
+                  mock.patch.dict(MODULE.os.environ, {"OP_SESSION_example": "old", "OTHER": "op://Private/other/password"})):
+                MODULE.run_batch(valid_manifest(), refs, ["--", "approved-program"])
+            self.assertEqual(lookup.call_count, 1)
+            self.assertEqual(run.call_count, 1)
+            args = run.call_args.args[0]
+            self.assertEqual(args[-4:], ["/usr/bin/env", "-u", "OP_SERVICE_ACCOUNT_TOKEN", "approved-program"])
+            env = run.call_args.kwargs["environment"]
+            self.assertEqual(env["OP_BIOMETRIC_UNLOCK_ENABLED"], "false")
+            self.assertNotIn("OP_SESSION_example", env)
+            self.assertNotIn("OTHER", env)
+            self.assertNotIn(token.decode(), str(args))
+
+    def test_batch_rejects_outside_vault_before_keychain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            refs = Path(directory) / "refs.env"
+            refs.write_text("API_TOKEN=op://Private/credential/password\n")
+            with mock.patch.object(MODULE, "keychain_lookup") as lookup:
+                with self.assertRaises(MODULE.ProvisionError):
+                    MODULE.run_batch(valid_manifest(), refs, ["approved-program"])
+                lookup.assert_not_called()
+
+    def test_real_os_pipe_preserves_synthetic_bytes(self):
+        result = MODULE.run_command([sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"], input_data=b"synthetic-input")
+        self.assertEqual(result.stdout, b"synthetic-input")
+
+    def test_source_resolution_does_not_enumerate_private_items(self):
+        source = {"id": "exact-id", "title": "Example API credential"}
+        with mock.patch.object(MODULE, "run_json", return_value=source) as run:
+            resolved = MODULE.resolve_source_items(valid_manifest(), {})
+        self.assertEqual(resolved[0]["id"], "exact-id")
+        self.assertEqual(run.call_args.args[0][:3], ["op", "item", "get"])
+        self.assertEqual(run.call_count, 1)
+
+    def test_unknown_recovery_lookup_failure_stops_before_writes(self):
+        with (mock.patch.object(MODULE, "vault_names", return_value=["Private"]),
+              mock.patch.object(MODULE, "run_command", return_value=subprocess.CompletedProcess([], 1, b"", b"network failure")),
+              mock.patch.object(MODULE, "keychain_lookup") as lookup):
+            with self.assertRaisesRegex(MODULE.ProvisionError, "absence is unverified"):
+                MODULE.preflight(valid_manifest(), {}, Path("unused"))
+            lookup.assert_not_called()
+
+    def test_copy_preserves_source_and_checks_destination(self):
+        source = {"id": "source", "title": "Example API credential", "category": "PASSWORD", "fields": [{"id": "password", "value": "synthetic"}]}
+        saved = dict(source, id="destination")
+        with (mock.patch.object(MODULE, "run_json", side_effect=[source, saved]),
+              mock.patch.object(MODULE, "run_command", return_value=subprocess.CompletedProcess([], 0, b'{"id":"destination"}')) as run):
+            MODULE.copy_selected_item({"id": "source", "title": source["title"], "source_vault": "Private"}, "Example Production", {})
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:3], ["op", "item", "create"])
+        payload = json.loads(run.call_args.kwargs["input_data"])
+        self.assertNotIn("id", payload)
+        self.assertEqual(payload["fields"], source["fields"])
+
+    def test_recovery_replacement_is_audited_before_keychain_write(self):
+        with (mock.patch.object(MODULE, "require_tools"),
+              mock.patch.object(MODULE, "personal_environment", return_value={}),
+              mock.patch.object(MODULE, "read_recovery_token", return_value=b"ops_" + b"x" * 600),
+              mock.patch.object(MODULE, "verify_scope", side_effect=MODULE.ProvisionError("wrong scope")),
+              mock.patch.object(MODULE, "compile_keychain_helper") as compile_helper):
+            with self.assertRaises(MODULE.ProvisionError):
+                MODULE.sync_keychain(valid_manifest(), "example-provisioner")
+            compile_helper.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
